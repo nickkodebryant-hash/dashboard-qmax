@@ -1,0 +1,9 @@
+streamlit
+pandas
+plotly
+openpyxl
+pyxlsb
+pypdf
+bcrypt
+sqlalchemy
+psycopg[binary]
