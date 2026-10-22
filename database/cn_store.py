@@ -1294,6 +1294,7 @@ def _status_cn(etapas: list[dict[str, Any]], hoje: date) -> str:
 
 
 def resumir_cns(database_url: str | None = None) -> tuple[int, int]:
+    inicializar_banco(database_url)
     engine = _engine(database_url)
     with engine.connect() as conexao:
         registros = pd.read_sql(select(cn_registros.c.id), conexao)
