@@ -43,6 +43,7 @@ from database.cn_store import (
     excluir_cn,
     importar_cns,
     administrar_responsavel,
+    inicializar_banco,
     listar_numeros_cns_importadas,
     listar_responsaveis_administracao,
     limpar_cns_importadas,
@@ -2081,6 +2082,7 @@ def render_gestao_cns() -> None:
         st.session_state.pop("_usuario_gestao_cns", None)
         st.rerun()
     try:
+        inicializar_banco()
         dataframe = carregar_cns()
         responsaveis = carregar_responsaveis()
         referencias = carregar_referencias_cns()
