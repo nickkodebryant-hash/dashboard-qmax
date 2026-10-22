@@ -15,6 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from database.calibration_store import (
     PAPEIS_AUDITORIA,
+    _engine,
     autenticar_usuario,
     criar_usuario,
     exportar_dataframe_csv,
@@ -54,6 +55,7 @@ from database.cn_store import (
     registrar_alerta_importacao,
     reimportar_base_cns,
     salvar_referencias_cns,
+    salvar_responsavel,
 )
 
 
@@ -2065,6 +2067,23 @@ def _processar_escalonamentos_periodicamente() -> None:
             )
 
 
+def _garantir_responsavel_usuario(
+    usuario: dict[str, Any],
+    database_url: str | None = None,
+) -> pd.DataFrame:
+    responsaveis = carregar_responsaveis(database_url)
+    if responsaveis.empty and usuario["perfil"] in PAPEIS_AUDITORIA:
+        salvar_responsavel(
+            usuario["nome"],
+            usuario["email"],
+            "Não informado",
+            usuario["email"],
+            database_url,
+        )
+        responsaveis = carregar_responsaveis(database_url)
+    return responsaveis
+
+
 def render_gestao_cns() -> None:
     st.markdown("## 📋 Gestão de CN's")
     usuario = _render_autenticacao()
@@ -2084,12 +2103,19 @@ def render_gestao_cns() -> None:
     try:
         inicializar_banco()
         dataframe = carregar_cns()
-        responsaveis = carregar_responsaveis()
+        responsaveis = _garantir_responsavel_usuario(usuario)
         referencias = carregar_referencias_cns()
     except SQLAlchemyError as erro:
         logger.exception("Falha ao inicializar a Gestão de CN's.")
         st.error(f"Não foi possível carregar os dados das CNs: {erro}")
         return
+    if _engine().dialect.name == "sqlite":
+        st.warning(
+            "O banco configurado é SQLite local. No Streamlit Cloud, os dados "
+            "podem desaparecer após reinicializações ou novos deploys. Configure "
+            "um banco PostgreSQL persistente em Manage app → Settings → Secrets, "
+            "usando a chave QMAX_CALIBRACAO_DATABASE_URL."
+        )
     st.session_state["_responsaveis_cns_nomes"] = {
         str(linha.email): str(linha.usuario)
         for linha in responsaveis.itertuples(index=False)

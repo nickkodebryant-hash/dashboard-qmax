@@ -42,6 +42,7 @@ DATABASE_PATH = (
     / "calibracao.db"
 )
 DATABASE_URL_SECRET = "QMAX_CALIBRACAO_DATABASE_URL"
+REQUIRE_SHARED_DATABASE_SECRET = "QMAX_REQUIRE_SHARED_DATABASE"
 PERFIS_USUARIO = ("ADMIN", "QUALIDADE", "LEITOR")
 STATUS_USUARIO = ("PENDENTE", "ATIVO", "REJEITADO")
 PAPEIS_AUDITORIA = {"ADMIN", "QUALIDADE"}
@@ -140,13 +141,48 @@ def _url_configurada() -> str:
             url = st.secrets.get(DATABASE_URL_SECRET)
         except StreamlitSecretNotFoundError:
             url = None
+    if url:
+        url = str(url).strip()
+    exigir_banco_compartilhado = os.environ.get(
+        REQUIRE_SHARED_DATABASE_SECRET
+    )
+    if exigir_banco_compartilhado is None:
+        try:
+            exigir_banco_compartilhado = st.secrets.get(
+                REQUIRE_SHARED_DATABASE_SECRET,
+                False,
+            )
+        except StreamlitSecretNotFoundError:
+            exigir_banco_compartilhado = False
+    if not isinstance(exigir_banco_compartilhado, bool):
+        valor_obrigatoriedade = str(exigir_banco_compartilhado).strip().casefold()
+        if valor_obrigatoriedade in {"1", "true", "yes", "sim"}:
+            exigir_banco_compartilhado = True
+        elif valor_obrigatoriedade in {"0", "false", "no", "não", "nao", ""}:
+            exigir_banco_compartilhado = False
+        else:
+            raise ValueError(
+                f"{REQUIRE_SHARED_DATABASE_SECRET} deve ser true ou false."
+            )
     if not url:
+        if exigir_banco_compartilhado:
+            raise RuntimeError(
+                f"{DATABASE_URL_SECRET} não foi configurada. "
+                f"Configure a conexão PostgreSQL persistente antes de iniciar o app."
+            )
         _migrar_banco_local(LEGACY_DATABASE_PATH, DATABASE_PATH)
         return f"sqlite:///{DATABASE_PATH.resolve().as_posix()}"
     if url.startswith("postgres://"):
         url = "postgresql+psycopg://" + url[len("postgres://") :]
     elif url.startswith("postgresql://"):
         url = "postgresql+psycopg://" + url[len("postgresql://") :]
+    if exigir_banco_compartilhado and not url.startswith(
+        ("postgresql://", "postgresql+psycopg://")
+    ):
+        raise ValueError(
+            f"{REQUIRE_SHARED_DATABASE_SECRET} está ativo, mas "
+            f"{DATABASE_URL_SECRET} não aponta para PostgreSQL."
+        )
     return url
 
 
@@ -873,6 +909,7 @@ def carregar_equipamentos() -> pd.DataFrame:
 
 
 def resumir_equipamentos() -> tuple[int, int]:
+    inicializar_banco()
     with _engine().connect() as conexao:
         registros = pd.read_sql(
             select(equipamentos.c.proxima_calibracao),
