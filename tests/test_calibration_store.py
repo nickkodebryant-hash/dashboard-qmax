@@ -11,10 +11,13 @@ from unittest.mock import patch
 
 import openpyxl
 import pandas as pd
+from sqlalchemy import delete
 
 from database.calibration_store import (
     DATABASE_URL_SECRET,
+    REQUIRE_SHARED_DATABASE_SECRET,
     _engine_para_url,
+    _url_configurada,
     aprovar_solicitacao,
     autenticar_usuario,
     carregar_auditoria_alteracoes,
@@ -28,11 +31,15 @@ from database.calibration_store import (
     listar_usuarios,
     listar_analises_certificados,
     _migrar_banco_local,
+    metadata,
+    migrar_administrador_sqlite,
     provisionar_administrador,
+    recuperar_primeiro_administrador,
     redefinir_senha_administrador,
     registrar_evento,
-    salvar_analise_certificado,
     resumir_equipamentos,
+    salvar_analise_certificado,
+    usuarios,
 )
 from core.calibration_management import importar_planilha_cal
 
@@ -69,7 +76,10 @@ class CalibrationStoreTests(unittest.TestCase):
         self.database_url = database_url
         self.env_patch = patch.dict(
             os.environ,
-            {DATABASE_URL_SECRET: database_url},
+            {
+                DATABASE_URL_SECRET: database_url,
+                REQUIRE_SHARED_DATABASE_SECRET: "false",
+            },
         )
         self.env_patch.start()
         inicializar_banco()
@@ -84,6 +94,76 @@ class CalibrationStoreTests(unittest.TestCase):
         _engine_para_url(self.database_url).dispose()
         _engine_para_url.cache_clear()
         self.temp_dir.cleanup()
+
+    def test_required_shared_database_fails_without_connection_url(self):
+        with patch("database.calibration_store.st.secrets", {}):
+            with patch.dict(
+                os.environ,
+                {
+                    DATABASE_URL_SECRET: "",
+                    REQUIRE_SHARED_DATABASE_SECRET: "true",
+                },
+            ):
+                with self.assertRaisesRegex(RuntimeError, DATABASE_URL_SECRET):
+                    _url_configurada()
+
+    def test_required_shared_database_normalizes_postgres_url(self):
+        url = "postgres://user:password@db.example.com:5432/qmax?sslmode=require"
+        with patch.dict(
+            os.environ,
+            {
+                DATABASE_URL_SECRET: url,
+                REQUIRE_SHARED_DATABASE_SECRET: "true",
+            },
+        ):
+            self.assertEqual(
+                _url_configurada(),
+                "postgresql+psycopg://user:password@db.example.com:5432/qmax?sslmode=require",
+            )
+
+    def test_required_shared_database_rejects_sqlite_url(self):
+        with patch.dict(
+            os.environ,
+            {
+                DATABASE_URL_SECRET: "sqlite:///local.db",
+                REQUIRE_SHARED_DATABASE_SECRET: "true",
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "não aponta para PostgreSQL"):
+                _url_configurada()
+
+    def test_invalid_shared_database_setting_is_rejected(self):
+        with patch.dict(
+            os.environ,
+            {REQUIRE_SHARED_DATABASE_SECRET: "treu"},
+        ):
+            with self.assertRaisesRegex(ValueError, "deve ser true ou false"):
+                _url_configurada()
+
+    def test_equipment_summary_initializes_empty_database(self):
+        with tempfile.TemporaryDirectory() as diretorio:
+            database_url = "sqlite:///" + (
+                Path(diretorio) / "resumo-vazio.db"
+            ).as_posix()
+            with patch.dict(os.environ, {DATABASE_URL_SECRET: database_url}):
+                try:
+                    self.assertEqual(resumir_equipamentos(), (0, 0))
+                finally:
+                    _engine_para_url(database_url).dispose()
+
+    def test_database_schema_initialization_runs_once_per_database_url(self):
+        database_url = "sqlite:///" + (
+            Path(self.temp_dir.name) / "schema-cache.db"
+        ).as_posix()
+        with patch(
+            "database.calibration_store.metadata.create_all",
+            wraps=metadata.create_all,
+        ) as criar_tabelas:
+            inicializar_banco(database_url)
+            inicializar_banco(database_url)
+
+        self.assertEqual(criar_tabelas.call_count, 1)
+        _engine_para_url(database_url).dispose()
 
     def test_registration_requires_admin_approval_and_hashes_password(self):
         solicitacao_id = criar_usuario(
@@ -107,6 +187,105 @@ class CalibrationStoreTests(unittest.TestCase):
         eventos = carregar_auditoria_eventos()
         self.assertIn("Usuário aprovado", eventos["Tipo de Evento"].tolist())
         self.assertIn("Tentativa de login inválida", eventos["Tipo de Evento"].tolist())
+
+    def test_recovers_pending_user_as_first_admin_when_no_active_admin_exists(self):
+        with _engine_para_url(self.database_url).begin() as conexao:
+            conexao.execute(
+                delete(usuarios).where(usuarios.c.email == "admin@example.com")
+            )
+        criar_usuario(
+            "Nickolas",
+            "nickolas@example.com",
+            "SenhaAntiga!123",
+        )
+
+        recuperar_primeiro_administrador(
+            "Nickolas Oliveira",
+            "nickolas@example.com",
+            "NovaSenhaSegura!456",
+        )
+
+        admin = autenticar_usuario(
+            "nickolas@example.com",
+            "NovaSenhaSegura!456",
+        )
+        self.assertEqual(admin["perfil"], "ADMIN")
+        self.assertEqual(admin["nome"], "Nickolas Oliveira")
+        self.assertIsNone(
+            autenticar_usuario("nickolas@example.com", "SenhaAntiga!123")
+        )
+
+    def test_first_admin_recovery_refuses_when_active_admin_exists(self):
+        criar_usuario(
+            "Conta Pendente",
+            "pendente@example.com",
+            "SenhaSegura!456",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Já existe um administrador ativo"):
+            recuperar_primeiro_administrador(
+                "Conta Pendente",
+                "pendente@example.com",
+                "NovaSenhaSegura!456",
+            )
+
+        self.assertIsNone(
+            autenticar_usuario("pendente@example.com", "NovaSenhaSegura!456")
+        )
+
+    def test_migrates_active_admin_from_sqlite_and_preserves_password(self):
+        origem = Path(self.temp_dir.name) / "legado.db"
+        origem_url = "sqlite:///" + origem.as_posix()
+        destino = Path(self.temp_dir.name) / "destino.db"
+        destino_url = "sqlite:///" + destino.as_posix()
+        provisionar_administrador(
+            "Admin Legado",
+            "legado@example.com",
+            "SenhaLegada!123",
+            database_url=origem_url,
+        )
+
+        try:
+            migrar_administrador_sqlite(
+                origem,
+                "LEGADO@example.com",
+                database_url=destino_url,
+            )
+            with patch.dict(os.environ, {DATABASE_URL_SECRET: destino_url}):
+                admin = autenticar_usuario(
+                    "legado@example.com",
+                    "SenhaLegada!123",
+                )
+            if admin is None:
+                self.fail("A senha do administrador migrado não autenticou.")
+            self.assertEqual(admin["perfil"], "ADMIN")
+            self.assertEqual(admin["nome"], "Admin Legado")
+        finally:
+            _engine_para_url(origem_url).dispose()
+            _engine_para_url(destino_url).dispose()
+
+    def test_sqlite_admin_migration_refuses_to_replace_active_destination_admin(self):
+        origem = Path(self.temp_dir.name) / "legado-com-admin.db"
+        origem_url = "sqlite:///" + origem.as_posix()
+        provisionar_administrador(
+            "Outro Admin",
+            "outro-admin@example.com",
+            "SenhaLegada!123",
+            database_url=origem_url,
+        )
+
+        try:
+            with self.assertRaisesRegex(ValueError, "Já existe um administrador ativo"):
+                migrar_administrador_sqlite(
+                    origem,
+                    "outro-admin@example.com",
+                    database_url=self.database_url,
+                )
+            self.assertIsNotNone(
+                autenticar_usuario("admin@example.com", "SenhaSegura!123")
+            )
+        finally:
+            _engine_para_url(origem_url).dispose()
 
     def test_approval_and_account_creation_validate_permissions(self):
         request_id = criar_usuario("Visitante", "visitante@example.com", "SenhaSegura!456")
@@ -234,7 +413,7 @@ class CalibrationStoreTests(unittest.TestCase):
             2,
         )
 
-    def test_equipment_summary_reads_existing_data_without_initializing_database(self):
+    def test_equipment_summary_initializes_before_reading_existing_data(self):
         quality = criar_usuario(
             "Pessoa Qualidade",
             "qualidade@example.com",
@@ -247,11 +426,7 @@ class CalibrationStoreTests(unittest.TestCase):
         )
         importar_equipamentos(equipment, "qualidade@example.com")
 
-        with patch(
-            "database.calibration_store.inicializar_banco",
-            side_effect=AssertionError("The summary must not initialize or migrate the database."),
-        ):
-            self.assertEqual(resumir_equipamentos(), (1, 1))
+        self.assertEqual(resumir_equipamentos(), (1, 1))
 
     def test_import_rejects_duplicate_normalized_codes_and_readers(self):
         quality = criar_usuario(

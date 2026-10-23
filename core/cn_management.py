@@ -2072,14 +2072,26 @@ def _garantir_responsavel_usuario(
     database_url: str | None = None,
 ) -> pd.DataFrame:
     responsaveis = carregar_responsaveis(database_url)
-    if responsaveis.empty and usuario["perfil"] in PAPEIS_AUDITORIA:
+    if usuario["perfil"] not in PAPEIS_AUDITORIA:
+        return responsaveis
+
+    emails_existentes = {
+        str(email).strip().casefold() for email in responsaveis["email"]
+    }
+    usuarios_ativos = listar_usuarios("ATIVO")
+    novos_responsaveis = usuarios_ativos[
+        usuarios_ativos["perfil"].isin(PAPEIS_AUDITORIA)
+        & ~usuarios_ativos["email"].str.casefold().isin(emails_existentes)
+    ]
+    for candidato in novos_responsaveis.itertuples(index=False):
         salvar_responsavel(
-            usuario["nome"],
-            usuario["email"],
+            str(candidato.nome),
+            str(candidato.email),
             "Não informado",
             usuario["email"],
             database_url,
         )
+    if not novos_responsaveis.empty:
         responsaveis = carregar_responsaveis(database_url)
     return responsaveis
 

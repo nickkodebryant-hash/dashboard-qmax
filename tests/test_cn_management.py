@@ -17,12 +17,14 @@ from core.cn_management import (
     _dados_gantt_cns,
     _figura_gantt_cns,
     _formatar_identificador_cn,
+    _garantir_responsavel_usuario,
     _indicadores_dashboard,
     _referencias_para_familia,
     analisar_planilha_cns,
 )
 from database.calibration_store import (
     DATABASE_URL_SECRET,
+    REQUIRE_SHARED_DATABASE_SECRET,
     _engine_para_url,
     autenticar_usuario,
     aprovar_solicitacao,
@@ -41,6 +43,7 @@ from database.cn_store import (
     cn_notificacoes,
     cn_registros,
     carregar_cns,
+    carregar_responsaveis,
     carregar_notificacoes,
     carregar_referencias_cns,
     carregar_todas_notificacoes_administracao,
@@ -123,7 +126,10 @@ class CNManagementTests(unittest.TestCase):
         )
         self.env_patch = patch.dict(
             os.environ,
-            {DATABASE_URL_SECRET: self.database_url},
+            {
+                DATABASE_URL_SECRET: self.database_url,
+                REQUIRE_SHARED_DATABASE_SECRET: "false",
+            },
         )
         self.env_patch.start()
         inicializar_banco(self.database_url)
@@ -164,6 +170,106 @@ class CNManagementTests(unittest.TestCase):
         self.assertEqual(cns.iloc[0]["status"], "ATRASADO")
         self.assertIsNone(cns.iloc[0]["etapas"][0]["data_conclusao"])
         self.assertEqual(cns.iloc[0]["etapas"][0]["status_calculado"], "ATRASADO")
+
+    def test_cn_summary_initializes_empty_database(self):
+        with tempfile.TemporaryDirectory() as diretorio:
+            database_url = "sqlite:///" + (Path(diretorio) / "cn-summary.db").as_posix()
+            try:
+                self.assertEqual(resumir_cns(database_url), (0, 0))
+            finally:
+                _engine_para_url(database_url).dispose()
+
+    def test_approved_user_is_added_as_responsible_when_none_are_active(self):
+        responsavel = carregar_responsaveis(self.database_url).iloc[0]
+        administrar_responsavel(
+            int(responsavel["id"]),
+            responsavel["usuario"],
+            responsavel["email"],
+            responsavel["setor"],
+            False,
+            "admin@example.com",
+            self.database_url,
+        )
+
+        responsaveis = _garantir_responsavel_usuario(
+            {
+                "nome": "Admin CN",
+                "email": "admin@example.com",
+                "perfil": "ADMIN",
+            },
+            self.database_url,
+        )
+
+        self.assertEqual(responsaveis["email"].tolist(), ["admin@example.com"])
+        self.assertEqual(responsaveis.iloc[0]["setor"], "Não informado")
+
+    def test_active_cn_users_are_added_as_responsibles_and_pending_users_are_omitted(self):
+        request_id = criar_usuario(
+            "Giovana Oliveira",
+            "giovana@example.com",
+            "SenhaSegura!456",
+        )
+        usuario_sessao = {
+            "nome": "Admin CN",
+            "email": "admin@example.com",
+            "perfil": "ADMIN",
+        }
+
+        responsaveis = _garantir_responsavel_usuario(
+            usuario_sessao,
+            self.database_url,
+        )
+        self.assertNotIn("giovana@example.com", responsaveis["email"].tolist())
+
+        aprovar_solicitacao(request_id, "admin@example.com", "QUALIDADE")
+        responsaveis = _garantir_responsavel_usuario(
+            usuario_sessao,
+            self.database_url,
+        )
+
+        giovana = responsaveis.loc[
+            responsaveis["email"] == "giovana@example.com"
+        ].iloc[0]
+        self.assertEqual(giovana["usuario"], "Giovana Oliveira")
+        self.assertEqual(giovana["setor"], "Não informado")
+
+        administrar_responsavel(
+            int(giovana["id"]),
+            giovana["usuario"],
+            giovana["email"],
+            "Engenharia",
+            True,
+            "admin@example.com",
+            self.database_url,
+        )
+        responsaveis = _garantir_responsavel_usuario(
+            usuario_sessao,
+            self.database_url,
+        )
+        giovana = responsaveis.loc[
+            responsaveis["email"] == "giovana@example.com"
+        ]
+        self.assertEqual(len(giovana), 1)
+        self.assertEqual(giovana.iloc[0]["setor"], "Engenharia")
+
+    def test_leitor_is_not_added_as_a_responsible_for_cn_registration(self):
+        request_id = criar_usuario(
+            "Leitor CN",
+            "leitor@example.com",
+            "SenhaSegura!456",
+        )
+        aprovar_solicitacao(request_id, "admin@example.com", "LEITOR")
+
+        responsaveis = _garantir_responsavel_usuario(
+            {
+                "nome": "Admin CN",
+                "email": "admin@example.com",
+                "perfil": "ADMIN",
+            },
+            self.database_url,
+        )
+
+        self.assertNotIn("leitor@example.com", responsaveis["email"].tolist())
 
     def test_import_matches_line_code_by_family_and_description(self):
         workbook = openpyxl.load_workbook(BytesIO(criar_planilha_cns()))
@@ -506,11 +612,7 @@ class CNManagementTests(unittest.TestCase):
             carregar_notificacoes("admin@example.com", self.database_url)
         )
 
-        with patch(
-            "database.cn_store.inicializar_banco",
-            side_effect=AssertionError("The summary must not initialize or migrate the database."),
-        ):
-            self.assertEqual(resumir_cns(self.database_url), (1, 1))
+        self.assertEqual(resumir_cns(self.database_url), (1, 1))
 
         self.assertEqual(len(carregar_auditoria(self.database_url)), auditoria_antes)
         self.assertEqual(
@@ -558,11 +660,7 @@ class CNManagementTests(unittest.TestCase):
                 select(func.count()).select_from(cn_notificacoes)
             ).scalar_one()
 
-        with patch(
-            "database.cn_store.inicializar_banco",
-            side_effect=AssertionError("A leitura não deve inicializar nem migrar o banco."),
-        ):
-            cns = carregar_cns(self.database_url)
+        cns = carregar_cns(self.database_url)
 
         self.assertEqual(cns.iloc[0]["status"], "ATRASADO")
         with engine.connect() as conexao:
